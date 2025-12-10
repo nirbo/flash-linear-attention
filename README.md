@@ -235,7 +235,44 @@ GLAForCausalLM(
 )
 ```
 
+
+### Gated DeltaNet CUDA Graph Support
+
+The Gated DeltaNet implementation supports CUDA Graph capture via `torch.compile(mode='max-autotune')` for reduced kernel overhead. This requires explicitly managing static buffers using `CUDAGraphManager` to overcome PyTorch's autograd limitations with CUDA Graphs.
+
+```python
+from fla.layers.gated_deltanet import GatedDeltaNet
+from fla.utils import CUDAGraphManager
+
+# 1. Initialize layer and manager
+model = GatedDeltaNet(hidden_size=2048).cuda()
+manager = CUDAGraphManager(
+    max_batch_size=32,
+    max_seq_len=2048,
+    num_heads=4,
+    head_dim=256,
+    value_dim=512,
+    dtype=torch.bfloat16
+)
+
+# 2. Compile with max-autotune (enables CUDA Graphs)
+model = torch.compile(model, mode='max-autotune')
+
+# 3. Training loop with static buffer management
+# Copy dynamic inputs to static buffers before forward pass
+static_q, static_k, static_v, static_g, static_beta, static_initial_state = manager.copy_inputs(
+    q=q, k=k, v=v, g=g, beta=beta, initial_state=None
+)
+
+# Pass the manager to the forward pass
+output, _ = model(
+    hidden_states,
+    cuda_graph_manager=manager
+)
+```
+
 ### Fused Modules
+
 
 We offer a collection of fused modules in `fla.modules` to facilitate faster training:
 

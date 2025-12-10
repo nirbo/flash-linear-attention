@@ -200,6 +200,7 @@ class GatedDeltaNet(nn.Module):
             self.o_norm = RMSNorm(self.head_v_dim, eps=norm_eps, dtype=torch.float32)
         self.o_proj = nn.Linear(self.value_dim, hidden_size, bias=False)
 
+    @torch.compiler.disable
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -210,6 +211,23 @@ class GatedDeltaNet(nn.Module):
         cuda_graph_manager: CUDAGraphManager | None = None,
         **kwargs: Unpack[dict],
     ) -> tuple[torch.Tensor, torch.Tensor | None, Cache | None]:
+        """
+        Args:
+            hidden_states (torch.Tensor):
+                Input hidden states of shape `[batch_size, seq_len, hidden_size]`.
+            attention_mask (torch.Tensor, Optional):
+                Attention mask of shape `[batch_size, seq_len]`, where 0 indicates padding.
+            past_key_values (Cache, Optional):
+                Cache for autoregressive generation.
+            use_cache (bool, Optional):
+                Whether to use cache. Default: `False`.
+            output_attentions (bool, Optional):
+                Whether to output attentions. Default: `False`.
+            cuda_graph_manager (CUDAGraphManager, Optional):
+                Manager for static buffers to support CUDA Graph capture with `torch.compile(mode='max-autotune')`.
+                If provided, the forward pass will use static buffers for the `chunk` kernel to ensure graph safety.
+                Required if attempting to capture a CUDA Graph.
+        """
         if attention_mask is not None:
             assert len(attention_mask.shape) == 2, (
                 "Expected attention_mask as a 0-1 matrix with shape [batch_size, seq_len] "
