@@ -31,7 +31,7 @@ class SimpleGDNModel(nn.Module):
         logits = self.head(x)
         return logits
 
-def train_loop(model, optimizer, B, T, D, steps=20):
+def train_loop(model, optimizer, B, T, D, steps=20, grad_accum_steps=1):
     model.train()
     loss_fn = nn.CrossEntropyLoss()
     
@@ -40,20 +40,27 @@ def train_loop(model, optimizer, B, T, D, steps=20):
         x = torch.randn(B, T, D, device='cuda', dtype=torch.bfloat16)
         y = torch.randint(0, 100, (B, T), device='cuda')
         
-        optimizer.zero_grad()
+        # Only zero grad at start of accumulation cycle
+        if i % grad_accum_steps == 0:
+            optimizer.zero_grad()
+
         logits = model(x)
         # logits: [B, T, 100]
         loss = loss_fn(logits.view(-1, 100), y.view(-1))
         
+        # Scale loss for accumulation
+        loss = loss / grad_accum_steps
         loss.backward()
         
-        # Clip grad for stability
-        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-        
-        optimizer.step()
+        # Step optimizer only at end of accumulation cycle
+        if (i + 1) % grad_accum_steps == 0:
+            # Clip grad for stability
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            
+            optimizer.step()
         
         if i % 5 == 0:
-            print(f"Step {i}: Loss {loss.item()}")
+            print(f"Step {i}: Loss {loss.item() * grad_accum_steps} (Accumulating: {((i+1) % grad_accum_steps) != 0})")
             
 def test_compile_max_autotune():
     print("Testing torch.compile(mode='max-autotune') with GDN layers...")
@@ -65,9 +72,9 @@ def test_compile_max_autotune():
     # Note: 'max-autotune' enables CUDA Graphs in Inductor.
     compiled_model = torch.compile(model, mode='max-autotune')
     
-    print("Starting Training Loop...")
+    print("Starting Training Loop with Gradient Accumulation=2...")
     try:
-        train_loop(compiled_model, optimizer, B, T, D, steps=20)
+        train_loop(compiled_model, optimizer, B, T, D, steps=20, grad_accum_steps=2)
         print("Training Loop Completed Successfully!")
     except Exception as e:
         print(f"FAILED with error: {e}")
