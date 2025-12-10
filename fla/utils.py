@@ -535,7 +535,7 @@ class CUDAGraphManager:
         self._current_T = T
 
         # Copy to static buffers (reshaping to flat)
-        # We perform copy on flat view to ensure contiguous fill
+        # Perform copy on flat view to ensure contiguous fill
         self.buf_q[:flat_cur].copy_(q.flatten(0, 1))
         self.buf_k[:flat_cur].copy_(k.flatten(0, 1))
         self.buf_v[:flat_cur].copy_(v.flatten(0, 1))
@@ -584,7 +584,7 @@ class CUDAGraphManager:
             self.buf_dbeta[:flat_cur].view(B, T, H),
         )
     
-    # Need to expose buf_A view logic correctly too since chunk.py accesses it directly
+    # Expose buf_A view logic since chunk.py accesses it directly
     def get_buf_A_view(self):
         B, T = self._current_B, self._current_T
         BT = self.chunk_size
