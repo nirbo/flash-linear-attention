@@ -1,9 +1,10 @@
 
 import pytest
 import torch
+
 from fla.ops.gated_delta_rule import chunk_gated_delta_rule
 from fla.utils import CUDAGraphManager
-from fla.layers.gated_deltanet import GatedDeltaNet
+
 
 @pytest.mark.parametrize("B, T, H, K, V", [(4, 128, 4, 128, 128), (2, 256, 4, 64, 64)])
 @pytest.mark.parametrize("dtype", [torch.bfloat16])

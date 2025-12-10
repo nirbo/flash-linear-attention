@@ -10,7 +10,7 @@ import warnings
 from collections.abc import Callable
 from enum import Enum
 from functools import lru_cache
-from typing import TYPE_CHECKING, Any, Optional, Tuple
+from typing import TYPE_CHECKING, Any
 
 import torch
 import triton
@@ -516,8 +516,8 @@ class CUDAGraphManager:
         v: torch.Tensor,
         g: torch.Tensor,
         beta: torch.Tensor,
-        initial_state: Optional[torch.Tensor] = None,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
+        initial_state: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None]:
         """
         Copy dynamic input tensors to static buffers.
         Unpacks (B, T) to flattened (B*T) buffer but returns (B, T) view.
@@ -526,9 +526,9 @@ class CUDAGraphManager:
         V = v.shape[-1]
         flat_cur = B * T
 
-        if B > self.max_batch_size:
+        if self.max_batch_size < B:
             raise ValueError(f"Batch size {B} exceeds max {self.max_batch_size}")
-        if T > self.max_seq_len:
+        if self.max_seq_len < T:
             raise ValueError(f"Seq len {T} exceeds max {self.max_seq_len}")
 
         self._current_B = B
@@ -559,7 +559,7 @@ class CUDAGraphManager:
             static_initial_state,
         )
 
-    def get_output_buffers(self) -> Tuple[torch.Tensor, torch.Tensor]:
+    def get_output_buffers(self) -> tuple[torch.Tensor, torch.Tensor]:
         """Get output buffers viewed as (B, T, ...)."""
         B, T = self._current_B, self._current_T
         flat_cur = B * T
@@ -568,7 +568,7 @@ class CUDAGraphManager:
             self.buf_final_state[:B]
         )
 
-    def get_grad_buffers(self) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    def get_grad_buffers(self) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """Get gradient buffers viewed as (B, T, ...)."""
         B, T = self._current_B, self._current_T
         flat_cur = B * T
@@ -591,7 +591,7 @@ class CUDAGraphManager:
         flat_cur = B * T
         return self.buf_A[:flat_cur].view(B, T, self.num_heads, BT)
 
-    def get_input_buffers(self) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
+    def get_input_buffers(self) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None]:
         """Get input buffers viewed as (B, T, ...)."""
         B, T = self._current_B, self._current_T
         flat_cur = B * T

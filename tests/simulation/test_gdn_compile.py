@@ -1,16 +1,14 @@
 
-import os
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
+
 from fla.layers.gated_deltanet import GatedDeltaNet
-from fla.utils import CUDAGraphManager
 
 # Set env var for torch compile debugging potentially
 # os.environ["TORCH_LOGS"] = "+inductor"
 
 class SimpleGDNModel(nn.Module):
-    def __init__(self, d_model, n_heads, n_layers=2):
+    def __init__(self, d_model, n_heads, n_layers=4):
         super().__init__()
         self.layers = nn.ModuleList([
             GatedDeltaNet(
