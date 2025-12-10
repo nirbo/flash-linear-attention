@@ -147,12 +147,8 @@ def test_cuda_graph_capture_replay(B, T, H, K, V, dtype):
     # Verify o (captured tensor) now contains the result for the new inputs
     # The output tensor o is effectively a view into manager.buf_o, which the graph writes to.
     
+    
     # Verify result correctness against eager run
     o_ref, _ = chunk_gated_delta_rule(q_new, k_new, v, g_new, beta)
-    
-    # Warning: `o` returned from capture is valid.
-    # But `o` contents are in `buf_o`.
-    # We need to make sure `o` (captured tensor) points to `buf_o`.
-    # Yes, it does.
     
     torch.testing.assert_close(o, o_ref, rtol=1e-3, atol=1e-3)
