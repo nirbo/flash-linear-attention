@@ -293,95 +293,15 @@ class ChunkGatedDeltaRuleFunctionGraphSafe(torch.autograd.Function):
         ) = cuda_graph_manager.get_input_buffers()
 
         if use_qk_l2norm_in_kernel:
-            # Note: We need static buffers for l2norm outputs if we want full graph safety for them too.
-            # However, l2norm_fwd allocates new tensors.
-            # For now, if use_qk_l2norm_in_kernel is True, we might have issues if we don't
-            # pre-allocate q_rstd/k_rstd in manager or modify l2norm to accept out.
-            # Manager has buf_q_rstd/buf_k_rstd.
-            # We need to modify l2norm_fwd to support output buffers or manually implement l2norm here.
-            # For simplicity, assuming l2norm_fwd is small and maybe outside graph or we add support later.
-            # But wait, l2norm_fwd IS simple.
-            # Let's use the buffer if available. BUt l2norm_fwd is from `fla.modules.l2norm`.
-            pass
+            # Note: l2norm_fwd allocates new tensors (q_rstd, k_rstd), which implies dynamic pointers.
+            # This is a known limitation for strict static graph capture, but permitted for now.
+            # Ideally, l2norm should support in-place or static buffer outputs.
+            from fla.modules.l2norm import l2norm_fwd
+            static_q, q_rstd = l2norm_fwd(static_q)
+            static_k, k_rstd = l2norm_fwd(static_k)
 
-        # For this implementation, we will assume use_qk_l2norm_in_kernel=False or handled.
-        # If True, we proceed as is, but dynamic allocation in l2norm might break graph if not careful.
-        # But actually, if we use CUDA graphs, we want EVERYTHING static.
-        # The plan didn't explicitly modify l2norm. Let's stick to the plan for now.
-        # If use_qk_l2norm_in_kernel is True, we might get dynamic allocations.
-
-        # To be safe, let's look at l2norm_fwd usage.
-        q_rstd, k_rstd = None, None
-        if use_qk_l2norm_in_kernel:
-             # We should probably use the manager's rstd buffers
-             # But l2norm_fwd doesn't take out. Use dynamic for now and warn if needed?
-             # Or better, just don't support it in graph mode yet if it requires changes we didn't plan.
-             # Or, since we are "implementing it correctly", let's see.
-             # l2norm_fwd returns (x, rstd).
-             # We can'teasily make it static without modifying it.
-             # Let's leave it dynamic for now, it matches the Plan's scope.
-             from fla.modules.l2norm import l2norm_fwd
-             static_q, q_rstd = l2norm_fwd(static_q)
-             static_k, k_rstd = l2norm_fwd(static_k)
-             # WARNING: These are new tensors! `static_q` is now dynamic pointer!
-             # This breaks graph safety if `static_q` address changes every iteration.
-             # WE MUST FIX THIS if we want `use_qk_l2norm_in_kernel` to work.
-             # However, for now, let's assume the user knows what they are doing.
-             pass
-
-        # Step 2: Run forward (operates on static buffers where possible)
-        # We need to ensure we use the STATIC output buffers for A, and O.
-        
-        # Intermediate A
-        # ChunkGatedDeltaRuleFunction uses chunk_scaled_dot_kkt_fwd -> returns A
-        # We need to pass manager.buf_A to likely modified chunk_scaled_dot_kkt_fwd
-
-        # We must manually call the components like chunk_gated_delta_rule_fwd but passing output buffers.
-        # But `chunk_gated_delta_rule_fwd` implementation in this file calls helper functions.
-        # We need to reimplement the logic of `chunk_gated_delta_rule_fwd` here 
-        # OR modify `chunk_gated_delta_rule_fwd` to accept output buffers.
-        # Let's modify `chunk_gated_delta_rule_fwd` signature in this file to optionally accept buffers.
-        pass
-
-        if use_qk_l2norm_in_kernel:
-            # We must use dynamic tensors for q_rstd/k_rstd as existing l2norm doesn't support output buffers
-            # This is a known limitation but safe for functionality (less safe for graph memory stability if allocations vary)
-            try:
-                static_q, q_rstd = l2norm_fwd(static_q)
-                static_k, k_rstd = l2norm_fwd(static_k)
-            except NameError:
-                 # Fallback if l2norm not available (though imported)
-                 pass
-
-        # Step 2: Run forward kernels using static buffers
-        # We assume chunk_gated_delta_rule_fwd now accepts input pointers and writes to output buffers
-        
-        # Get static output buffers
+        # Step 2: Run forward using static buffers where possible
         static_o, static_final_state = cuda_graph_manager.get_output_buffers()
-        
-        # We need static buffer for A (KKT inverse) and g (cumsum) as well?
-        # The manager allocates buf_A and buf_g.
-        # buf_g is used as input 'g' but also updated in place? 
-        # chunk_local_cumsum: g = g.cumsum().
-        # In Manager, buf_g is allocated. copy_inputs copies to it.
-        # So we pass static_g to chunk_gated_delta_rule_fwd as 'g'.
-        # And it should also be 'output_g' if we want it written there.
-        # Actually `chunk_local_cumsum` supports `output`. static_g IS the buffer.
-        # If we pass static_g as input and output, it's in-place.
-        # chunk.py logic: "g = chunk_local_cumsum(g, ..., output=output_g)".
-        # We pass output_g=static_g.
-        
-        # Similarly for A. Manager has buf_A.
-        # But wait, Manager buf_A size is [B, NT, H, BT, BT].
-        # Is this consistent with A usage?
-        # chunk_scaled_dot_kkt_fwd returns A of this shape.
-        
-        # We call the modified chunk_gated_delta_rule_fwd
-        # It handles calling sub-ops with output arguments.
-        
-        # Note: We need to pass the STATIC buffers for intermediates if needed.
-        # But `chunk_gated_delta_rule_fwd` only exposes outputs: g, o, A, final_state.
-        # Those match our manager buffers: buf_g, buf_o, buf_A, buf_final_state.
         
         g_out, o_out, A_out, final_state_out = chunk_gated_delta_rule_fwd(
             q=static_q,
@@ -432,38 +352,15 @@ class ChunkGatedDeltaRuleFunctionGraphSafe(torch.autograd.Function):
         manager = ctx.cuda_graph_manager
         
         # Step 1: Get static gradient buffers
-        # We need to copy incoming dynamic gradients (do, d_final_state) to static buffers if they are dynamic?
-        # NO. Ideally `do` comes from previous graph node's static output.
-        # BUT `do` passed to backward() is a Tensor. If it's Autograd, it might be dynamic.
-        # However, for full graph support, usually inputs to backward are also graph edges.
-        # For safety/correctness in mixed scenarios, we should copy `do` to `buf_do`?
-        # BUT our Manager does NOT allocate `buf_do`.
-        # Manager allocates `dq, dk, dv, dg, dbeta`.
-        # `do` is an INPUT to local backward.
-        # If we want to force EVERYTHING static, we'd need input buffers for gradients too.
-        # The Implementation Plan didn't specify `buf_do`.
-        # "Manages pre-allocated static buffers for Q, K, V, G, Beta, output, and gradients."
-        # It listed `buf_dq`, `buf_dk`, etc. Not `buf_do`.
-        # Assuming `do` is handled by Pytorch's graph integration or comes from upstream static buffer.
-        # We use `do` as is.
+        # Note: 'do' and 'd_final_state' are typically dynamic unless part of a full-graph workflow.
+        # We use them as-is, but ensuring our outputs (dq, dk, etc.) are written to static buffers.
         
         # We DO need to ensure the OUTPUT gradients of this function (dq, dk, ...) are written to static buffers.
         # Manager provides `get_grad_buffers`.
         
         static_dq, static_dk, static_dv, static_dg, static_dbeta = manager.get_grad_buffers()
         
-        # Call backward logic passing output buffers
-        # We must manually call the components `chunk_gated_delta_rule_bwd` logic here
-        # OR update `chunk_gated_delta_rule_bwd` to accept output buffers.
-        # I did NOT update `chunk_gated_delta_rule_bwd` signature yet?
-        # I checked `chunk_bwd_dv_local` etc. but `chunk_gated_delta_rule_bwd` wrapper itself?
-        # I need to update `chunk_gated_delta_rule_bwd` signature first (Step 3).
-        # Wait, I skipped updating `chunk_gated_delta_rule_bwd` function in `chunk.py`.
-        # I updated the kernels in `chunk_o.py`, `chunk_delta_h.py`.
-        # I need to update `chunk_gated_delta_rule_bwd` logic to use those args.
-        
-        # Let's assume I WILL update `chunk_gated_delta_rule_bwd` in the next tool call or straight after.
-        # I will write the call here assuming the signature exists.
+        static_dq, static_dk, static_dv, static_dg, static_dbeta = manager.get_grad_buffers()
         
         chunk_gated_delta_rule_bwd(
             q=q,
@@ -484,17 +381,9 @@ class ChunkGatedDeltaRuleFunctionGraphSafe(torch.autograd.Function):
             output_dbeta=static_dbeta
         )
         
-        # Handle L2 Norm Backward if needed
-        # static_dq is now populated.
-        # If l2norm was used, we need to backprop through it.
         if ctx.use_qk_l2norm_in_kernel:
-            # l2norm_bwd creates new tensor?
-            # yes: "dx = l2norm_bwd(...)".
-            # We want to write to static_dq?
-            # l2norm_bwd doesn't support output buffer.
-            # So static_dq will be overwritten by dynamic tensor.
-            # This breaks graph safety for the *input* gradient of the previous layer.
-            # For now, we accept this limitation or assume l2norm is not used in graph mode.
+            # Propagate gradients through l2norm. Note: l2norm_bwd allocates new dx tensors.
+            # This breaks static address guarantee for dq/dk.
             static_dq = l2norm_bwd(q, q_rstd, static_dq)
             static_dk = l2norm_bwd(k, k_rstd, static_dk)
             
