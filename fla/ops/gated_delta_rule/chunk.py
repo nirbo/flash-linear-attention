@@ -285,22 +285,17 @@ class ChunkGatedDeltaRuleFunctionGraphSafe(torch.autograd.Function):
         if cuda_graph_manager is None:
              raise ValueError("cuda_graph_manager must be provided for GraphSafe function")
              
-        # Step 1: Get static input buffers
-        # We assume copy_inputs was called OUTSIDE/BEFORE this function (in the wrapper).
-        # We just retrieve the views.
+        # Get static input buffers
         (
             static_q, static_k, static_v, static_g, static_beta, static_initial_state
         ) = cuda_graph_manager.get_input_buffers()
 
         if use_qk_l2norm_in_kernel:
-            # Note: l2norm_fwd allocates new tensors (q_rstd, k_rstd), which implies dynamic pointers.
-            # This is a known limitation for strict static graph capture, but permitted for now.
-            # Ideally, l2norm should support in-place or static buffer outputs.
+            # Note: l2norm_fwd allocates new tensors which may be dynamic.
             from fla.modules.l2norm import l2norm_fwd
             static_q, q_rstd = l2norm_fwd(static_q)
             static_k, k_rstd = l2norm_fwd(static_k)
 
-        # Step 2: Run forward using static buffers where possible
         static_o, static_final_state = cuda_graph_manager.get_output_buffers()
         
         g_out, o_out, A_out, final_state_out = chunk_gated_delta_rule_fwd(
@@ -313,22 +308,14 @@ class ChunkGatedDeltaRuleFunctionGraphSafe(torch.autograd.Function):
             initial_state=static_initial_state if initial_state is not None else None,
             output_final_state=output_final_state,
             cu_seqlens=cu_seqlens,
-            # Pass static buffers as OUTPUTS
-            output_g=static_g, # In-place update of g buffer
+            output_g=static_g,
             output_o=static_o,
-            output_A=cuda_graph_manager.get_buf_A_view(), # Get view (B, T, H, BT)
+            output_A=cuda_graph_manager.get_buf_A_view(),
             output_final_state_buffer=static_final_state if output_final_state else None
         )
 
-        # Update context for backward
-        # IMPORTANT: We save the STATIC buffers.
-        # When backward runs (during replay), these buffers will hold the data from the REPLAYED forward pass.
-        # This is exactly what we want for graph safety.
-        
-        # Handle L2 Norm extras if needed
-        # If use_qk_l2norm_in_kernel, q_rstd/k_rstd are dynamic.
-        # If captured, their pointers are captured.
-        # We save them.
+        # Save static buffers for backward
+        # If use_qk_l2norm_in_kernel, q_rstd/k_rstd might be dynamic.
         
         ctx.save_for_backward(
             static_q, q_rstd, static_k, k_rstd, static_v, static_g, static_beta, 
@@ -338,11 +325,6 @@ class ChunkGatedDeltaRuleFunctionGraphSafe(torch.autograd.Function):
         ctx.use_qk_l2norm_in_kernel = use_qk_l2norm_in_kernel
         ctx.cuda_graph_manager = cuda_graph_manager # Keep ref to manager
         
-        # Return slices of static buffers as results
-        # These are "dynamic" tensors backed by static memory.
-        # Downstream operations must handle them or copy them if they need persistence beyond the graph replay.
-        # But usually in a graph, subsequent nodes consume them.
-        
         return o_out, final_state_out
 
     @staticmethod
@@ -351,12 +333,7 @@ class ChunkGatedDeltaRuleFunctionGraphSafe(torch.autograd.Function):
         q, q_rstd, k, k_rstd, v, g, beta, A, initial_state, cu_seqlens = ctx.saved_tensors
         manager = ctx.cuda_graph_manager
         
-        # Step 1: Get static gradient buffers
-        # Note: 'do' and 'd_final_state' are typically dynamic unless part of a full-graph workflow.
-        # We use them as-is, but ensuring our outputs (dq, dk, etc.) are written to static buffers.
-        
-        # We DO need to ensure the OUTPUT gradients of this function (dq, dk, ...) are written to static buffers.
-        # Manager provides `get_grad_buffers`.
+        # Get static gradient buffers
         
         static_dq, static_dk, static_dv, static_dg, static_dbeta = manager.get_grad_buffers()
         
@@ -382,8 +359,7 @@ class ChunkGatedDeltaRuleFunctionGraphSafe(torch.autograd.Function):
         )
         
         if ctx.use_qk_l2norm_in_kernel:
-            # Propagate gradients through l2norm. Note: l2norm_bwd allocates new dx tensors.
-            # This breaks static address guarantee for dq/dk.
+            # Propagate gradients through l2norm. Note: allocates new dx tensors.
             static_dq = l2norm_bwd(q, q_rstd, static_dq)
             static_dk = l2norm_bwd(k, k_rstd, static_dk)
             
