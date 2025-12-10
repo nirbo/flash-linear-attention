@@ -119,9 +119,7 @@ def chunk_gated_delta_rule_bwd(
         scale=scale,
         cu_seqlens=cu_seqlens,
     )
-    if torch.isnan(dv).any():
-        print("NaN in dv! Saving debug_inputs.pt")
-        torch.save({'q':q, 'k':k, 'g':g, 'do':do, 'scale':scale}, 'debug_inputs.pt')
+
     dh, dh0, dv = chunk_gated_delta_rule_bwd_dhu(
         q=q,
         k=k,
@@ -156,7 +154,6 @@ def chunk_gated_delta_rule_bwd(
     )
     
     # Use explicit output buffers for prepare_wy_repr_bwd if provided
-    # Note: prepare_wy_repr_bwd returns dk2, dv, db, dg2
     dk2, dv, db, dg2 = prepare_wy_repr_bwd(
         k=k,
         v=v,
@@ -178,9 +175,6 @@ def chunk_gated_delta_rule_bwd(
         dk.add_(dk2)
         
     if output_dg is not None:
-        # If output_dg was passed to dqkwg, it would be partial.
-        # Here we passed None to dqkwg, so dg is a new tensor.
-        # We add dg2 to it, then cumsum into output_dg.
         dg.add_(dg2)
         chunk_local_cumsum(dg, chunk_size=64, reverse=True, cu_seqlens=cu_seqlens, output=output_dg)
         dg = output_dg
