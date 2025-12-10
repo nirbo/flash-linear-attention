@@ -279,10 +279,12 @@ class ChunkGatedDeltaRuleFunctionGraphSafe(torch.autograd.Function):
         if cuda_graph_manager is None:
              raise ValueError("cuda_graph_manager must be provided for GraphSafe function")
              
-        # Get static input buffers
+        # Copy dynamic inputs to static buffers
+        # This ensures the kernel reads from static addresses (needed for graph capture stability)
+        # but the data is fresh from the current forward pass.
         (
             static_q, static_k, static_v, static_g, static_beta, static_initial_state
-        ) = cuda_graph_manager.get_input_buffers()
+        ) = cuda_graph_manager.copy_inputs(q, k, v, g, beta, initial_state)
 
         if use_qk_l2norm_in_kernel:
             # Note: l2norm_fwd allocates new tensors which may be dynamic.
@@ -308,12 +310,18 @@ class ChunkGatedDeltaRuleFunctionGraphSafe(torch.autograd.Function):
             output_final_state_buffer=static_final_state if output_final_state else None
         )
 
-        # Save static buffers for backward
-        # If use_qk_l2norm_in_kernel, q_rstd/k_rstd might be dynamic.
+        # Save tensors for backward.
+        # CRITICAL: We must save the ORIGINAL dynamic inputs (q, k, v, etc.) or clones of outputs.
+        # We cannot save 'static_q' etc. because they are in-place overwritten in the next micro-batch
+        # (during gradient accumulation), which causes "modified by an inplace operation" errors.
         
+        # For A_out, it is a view of the static buffer, so we MUST clone it to preserve its value
+        # for the backward pass of this specific batch.
+        A_out_safe = A_out.clone()
+
         ctx.save_for_backward(
-            static_q, q_rstd, static_k, k_rstd, static_v, static_g, static_beta, 
-            A_out, static_initial_state, cu_seqlens
+            q, q_rstd, k, k_rstd, v, g, beta, 
+            A_out_safe, initial_state, cu_seqlens
         )
         ctx.scale = scale
         ctx.use_qk_l2norm_in_kernel = use_qk_l2norm_in_kernel
