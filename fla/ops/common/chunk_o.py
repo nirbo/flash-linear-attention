@@ -675,41 +675,13 @@ def chunk_bwd_dqkwg(
     if output_dg is None:
         dg = torch.empty(NK, *g.shape, dtype=torch.float32, device=g.device) if g is not None else None
     else:
-        if g is not None:
-             # dg from manager is (B, T, H), but kernel uses NK split if NK > 1
-             # Wait, existing logic: dg = torch.empty(NK, *g.shape)
-             # Then dg = dg.sum(0)
-             # If we want output_dg to be the FINAL output, we must handle reduction.
-             # Kernel writes to (NK, B, T, H).
-             # If manager output_dg is (B, T, H), we can't use it directly in kernel if NK > 1.
-             # If NK=1, we can reuse?
-             # Actually `dg.sum(0)` implies intermediate reduction is needed.
-             # Manager expects finalized gradients.
-             # So we might need an intermediate buffer for dg if NK > 1.
-             # Or we modify kernel to use atomic add? Kernel writes `tl.store(p_dg, ...)`
-             # If multiple blocks write to same dg, we need atomic add.
-             # Current kernel uses `NK` blocks in z-dimension `(NK, NT, B*H)`.
-             # `dg += i_k * all * H` in kernel line 197.
-             # It writes to separate slices.
-             # So we need a buffer of size (NK, B, T, H).
-             # `CUDAGraphManager` likely allocates (B, T, H) for `buf_dg`.
-             # So we CANNOT use `output_dg` directly in kernel if NK > 1.
-             # We need a temp buffer `dg_temp`.
-             # If NK=1 (e.g. K<=64), we can use `output_dg` (viewed as (1, B, T, H)).
-             # But if NK>1 (head_dim > 64), we need larger buffer.
-             # Manager `head_dim` is static.
-             # We could allocate `buf_dg_temp` in Manager if we want fully static.
-             # For now, let's keep `dg` dynamic if NK > 1, OR assume K <= 64 for static optimization? 
-             # No, standard is K=128 often.
-             # So we allocate `dg` locally (dynamic) and then sum into `output_dg`.
-             # This breaks "no dynamic" rule.
-             # BUT `dq`, `dk` are the big ones. `dg` is also (B, T, H), same size as q/k but scalar.
-             # `buf_dg` exists.
-             # Let's allocate temp `dg` if needed, then sum to `output_dg`.
-             # Or if possible, modify manager to allocate `buf_dg_temp`?
-             # For this task, I'll allocate dynamic temp `dg` and copy/sum to `output_dg`.
-             # Note: `output_dg` should be used for the result of `dg.sum(0)`.
-             dg = torch.empty(NK, *g.shape, dtype=torch.float32, device=g.device) if g is not None else None
+            if g is not None:
+                 # dg kernel output is (NK, B, T, H), but we need (B, T, H)
+                 # We allocate a temporary buffer for the split gradients first, 
+                 # then reduce them into the final output_dg.
+                 dg = torch.empty(NK, *g.shape, dtype=torch.float32, device=g.device)
+            else:
+                 dg = None
 
     if output_dw is None:
         dw = torch.empty_like(w) if w is not None else None
