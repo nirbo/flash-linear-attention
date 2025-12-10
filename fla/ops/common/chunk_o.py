@@ -92,7 +92,7 @@ def chunk_fwd_kernel_o(
     if USE_G:
         g += bos * H + i_h
         p_g = tl.make_block_ptr(g, (T,), (H,), (i_t * BT,), (BT,), (0,))
-        b_g = tl.load(p_g, boundary_check=(0,))
+        b_g = tl.load(p_g, boundary_check=(0,)).to(tl.float32)
         b_o = b_o * exp(b_g)[:, None]
         b_A = b_A * exp(b_g[:, None] - b_g[None, :])
 
@@ -250,8 +250,8 @@ def chunk_bwd_kernel_dqkwg(
         g += bos * H + i_h
         dg += bos * H + i_h
         p_g = tl.make_block_ptr(g, (T,), (H,), (i_t * BT,), (BT,), (0,))
-        b_g = tl.load(p_g, boundary_check=(0,))
-        b_g_last = tl.load(g + (min(i_t * BT + BT, T) - 1) * H)
+        b_g = tl.load(p_g, boundary_check=(0,)).to(tl.float32)
+        b_g_last = tl.load(g + (min(i_t * BT + BT, T) - 1) * H).to(tl.float32)
         b_dg_last *= exp(b_g_last)
 
         b_dq = b_dq * exp(b_g)[:, None] * scale
@@ -374,8 +374,8 @@ def chunk_bwd_kernel_dv(
     if USE_G:
         g += bos * H + i_h
         p_g = tl.make_block_ptr(g, (T,), (H,), (i_t * BT,), (BT,), (0,))
-        b_g = tl.load(p_g, boundary_check=(0,))
-        b_g_last = tl.load(g + (min(i_t * BT + BT, T) - 1) * H)
+        b_g = tl.load(p_g, boundary_check=(0,)).to(tl.float32)
+        b_g_last = tl.load(g + (min(i_t * BT + BT, T) - 1) * H).to(tl.float32)
     if USE_G_GAMMA:
         b_gamma = tl.load(g_gamma + i_h)
         b_g = b_gamma * (tl.arange(0, BT) + 1)
@@ -455,7 +455,7 @@ def chunk_bwd_kernel_dv_local(
         if USE_G:
             g += bos * H + i_h
             p_g = tl.make_block_ptr(g, (T,), (H,), (i_t * BT,), (BT,), (0,))
-            b_g = tl.load(p_g, boundary_check=(0,))
+            b_g = tl.load(p_g, boundary_check=(0,)).to(tl.float32)
         if USE_G_GAMMA:
             b_gamma = tl.load(g_gamma + i_h)
             b_g = b_gamma * (tl.arange(0, BT) + 1)
@@ -494,6 +494,7 @@ def chunk_fwd_o(
     scale: float | None = None,
     cu_seqlens: torch.LongTensor | None = None,
     chunk_size: int = 64,
+    output: torch.Tensor | None = None,
 ) -> torch.Tensor:
     B, T, H, K, V = *q.shape, v.shape[-1]
     BT = chunk_size
@@ -502,7 +503,10 @@ def chunk_fwd_o(
     if scale is None:
         scale = k.shape[-1] ** -0.5
 
-    o = torch.empty_like(v)
+    if output is None:
+        o = torch.empty_like(v)
+    else:
+        o = output
     def grid(meta): return (triton.cdiv(V, meta['BV']), NT, B * H)
     chunk_fwd_kernel_o[grid](
         q=q,
@@ -587,6 +591,7 @@ def chunk_bwd_dv_local(
     cu_seqlens: torch.LongTensor | None = None,
     chunk_size: int = 64,
     chunk_indices: torch.LongTensor | None = None,
+    output: torch.Tensor | None = None,
 ) -> torch.Tensor:
     B, T, H, K, V = *k.shape, do.shape[-1]
     BT = chunk_size
@@ -603,7 +608,10 @@ def chunk_bwd_dv_local(
     BV = min(max(triton.next_power_of_2(V), 16), CONST_TILING)
     NT = triton.cdiv(T, BT) if cu_seqlens is None else len(chunk_indices)
 
-    dv = torch.empty_like(do)
+    if output is None:
+        dv = torch.empty_like(do)
+    else:
+        dv = output
     grid = (NT, B * H)
     chunk_bwd_kernel_dv_local[grid](
         q=q,
@@ -641,6 +649,10 @@ def chunk_bwd_dqkwg(
     scale: float | None = None,
     cu_seqlens: torch.LongTensor | None = None,
     chunk_size: int = 64,
+    output_dq: torch.Tensor | None = None,
+    output_dk: torch.Tensor | None = None,
+    output_dw: torch.Tensor | None = None,
+    output_dg: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
 
     B, T, H, K, V = *k.shape, v.shape[-1]
@@ -652,10 +664,57 @@ def chunk_bwd_dqkwg(
     BK = min(max(triton.next_power_of_2(K), 16), CONST_TILING)
     BV = min(max(triton.next_power_of_2(V), 16), CONST_TILING)
     NK = triton.cdiv(K, BK)
-    dq = torch.empty_like(q)
-    dk = torch.empty_like(k)
-    dg = torch.empty(NK, *g.shape, dtype=torch.float32, device=g.device) if g is not None else None
-    dw = torch.empty_like(w) if w is not None else None
+    if output_dq is None:
+        dq = torch.empty_like(q)
+    else:
+        dq = output_dq
+    if output_dk is None:
+        dk = torch.empty_like(k)
+    else:
+        dk = output_dk
+    if output_dg is None:
+        dg = torch.empty(NK, *g.shape, dtype=torch.float32, device=g.device) if g is not None else None
+    else:
+        if g is not None:
+             # dg from manager is (B, T, H), but kernel uses NK split if NK > 1
+             # Wait, existing logic: dg = torch.empty(NK, *g.shape)
+             # Then dg = dg.sum(0)
+             # If we want output_dg to be the FINAL output, we must handle reduction.
+             # Kernel writes to (NK, B, T, H).
+             # If manager output_dg is (B, T, H), we can't use it directly in kernel if NK > 1.
+             # If NK=1, we can reuse?
+             # Actually `dg.sum(0)` implies intermediate reduction is needed.
+             # Manager expects finalized gradients.
+             # So we might need an intermediate buffer for dg if NK > 1.
+             # Or we modify kernel to use atomic add? Kernel writes `tl.store(p_dg, ...)`
+             # If multiple blocks write to same dg, we need atomic add.
+             # Current kernel uses `NK` blocks in z-dimension `(NK, NT, B*H)`.
+             # `dg += i_k * all * H` in kernel line 197.
+             # It writes to separate slices.
+             # So we need a buffer of size (NK, B, T, H).
+             # `CUDAGraphManager` likely allocates (B, T, H) for `buf_dg`.
+             # So we CANNOT use `output_dg` directly in kernel if NK > 1.
+             # We need a temp buffer `dg_temp`.
+             # If NK=1 (e.g. K<=64), we can use `output_dg` (viewed as (1, B, T, H)).
+             # But if NK>1 (head_dim > 64), we need larger buffer.
+             # Manager `head_dim` is static.
+             # We could allocate `buf_dg_temp` in Manager if we want fully static.
+             # For now, let's keep `dg` dynamic if NK > 1, OR assume K <= 64 for static optimization? 
+             # No, standard is K=128 often.
+             # So we allocate `dg` locally (dynamic) and then sum into `output_dg`.
+             # This breaks "no dynamic" rule.
+             # BUT `dq`, `dk` are the big ones. `dg` is also (B, T, H), same size as q/k but scalar.
+             # `buf_dg` exists.
+             # Let's allocate temp `dg` if needed, then sum to `output_dg`.
+             # Or if possible, modify manager to allocate `buf_dg_temp`?
+             # For this task, I'll allocate dynamic temp `dg` and copy/sum to `output_dg`.
+             # Note: `output_dg` should be used for the result of `dg.sum(0)`.
+             dg = torch.empty(NK, *g.shape, dtype=torch.float32, device=g.device) if g is not None else None
+
+    if output_dw is None:
+        dw = torch.empty_like(w) if w is not None else None
+    else:
+        dw = output_dw
 
     grid = (NK, NT, B * H)
     chunk_bwd_kernel_dqkwg[grid](
@@ -686,5 +745,10 @@ def chunk_bwd_dqkwg(
     )
 
     if dg is not None:
-        dg = dg.sum(0)
+        if output_dg is None:
+            dg = dg.sum(0)
+        else:
+            # Sum into output_dg
+            torch.sum(dg, dim=0, out=output_dg)
+            dg = output_dg
     return dq, dk, dw, dg

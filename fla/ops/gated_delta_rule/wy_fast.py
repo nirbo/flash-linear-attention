@@ -62,13 +62,13 @@ def recompute_w_u_fwd_kernel(
         p_v = tl.make_block_ptr(v + (bos*H + i_h) * V, (T, V), (H*V, 1), (i_t * BT, i_v * BV), (BT, BV), (1, 0))
         p_u = tl.make_block_ptr(u + (bos*H + i_h) * V, (T, V), (H*V, 1), (i_t * BT, i_v * BV), (BT, BV), (1, 0))
         b_v = tl.load(p_v, boundary_check=(0, 1))
-        b_vb = (b_v * b_b[:, None]).to(b_v.dtype)
-        b_u = tl.dot(b_A, b_vb, allow_tf32=False)
+        b_vb = (b_v * b_b[:, None]).to(tl.float32)
+        b_u = tl.dot(b_A.to(tl.float32), b_vb, allow_tf32=False)
         tl.store(p_u, b_u.to(p_u.dtype.element_ty), boundary_check=(0, 1))
 
     if USE_G:
         p_g = tl.make_block_ptr(g + (bos*H + i_h), (T,), (H,), (i_t * BT,), (BT,), (0,))
-        b_g = exp(tl.load(p_g, boundary_check=(0,)))
+        b_g = exp(tl.load(p_g, boundary_check=(0,)).to(tl.float32))
 
     for i_k in range(tl.cdiv(K, BK)):
         p_k = tl.make_block_ptr(k + (bos*H + i_h) * K, (T, K), (H*K, 1), (i_t * BT, i_k * BK), (BT, BK), (1, 0))
@@ -77,7 +77,7 @@ def recompute_w_u_fwd_kernel(
         b_kb = b_k * b_b[:, None]
         if USE_G:
             b_kb *= b_g[:, None]
-        b_w = tl.dot(b_A, b_kb.to(b_k.dtype))
+        b_w = tl.dot(b_A.to(tl.float32), b_kb.to(tl.float32))
         tl.store(p_w, b_w.to(p_w.dtype.element_ty), boundary_check=(0, 1))
 
 
@@ -139,7 +139,7 @@ def prepare_wy_repr_bwd_kernel(
 
     if USE_G:
         p_g = tl.make_block_ptr(g + (bos*H + i_h), (T,), (H,), (i_t * BT,), (BT,), (0,))
-        b_g = tl.load(p_g, boundary_check=(0,))
+        b_g = tl.load(p_g, boundary_check=(0,)).to(tl.float32)
         b_g_exp = tl.exp(b_g)
         b_dg = tl.zeros([BT], dtype=tl.float32)
 
@@ -156,7 +156,7 @@ def prepare_wy_repr_bwd_kernel(
         b_dw = tl.load(p_dw, boundary_check=(0, 1))
 
         b_dA += tl.dot(b_dw, tl.trans(b_kbg).to(b_dw.dtype))
-        b_dkbg = tl.dot(b_A, b_dw)
+        b_dkbg = tl.dot(b_A.to(tl.float32), b_dw.to(tl.float32))
         if USE_G:
             b_dk = b_dkbg * (b_g_exp * b_b)[:, None]
             b_db += tl.sum(b_dkbg * b_k * b_g_exp[:, None], 1)
@@ -171,7 +171,7 @@ def prepare_wy_repr_bwd_kernel(
         b_vb = (b_v * b_b[:, None]).to(b_v.dtype)
         b_du = tl.load(p_du, boundary_check=(0, 1))
         b_dA += tl.dot(b_du, tl.trans(b_vb))
-        b_dvb = tl.dot(b_A, b_du)
+        b_dvb = tl.dot(b_A.to(tl.float32), b_du.to(tl.float32))
         b_dv = b_dvb * b_b[:, None]
         b_db += tl.sum(b_dvb * b_v, 1)
         tl.store(p_dv, b_dv.to(p_dv.dtype.element_ty), boundary_check=(0, 1))
@@ -196,9 +196,9 @@ def prepare_wy_repr_bwd_kernel(
         b_dk = tl.load(p_dk, boundary_check=(0, 1))
         b_kb = (b_k * b_b[:, None]).to(b_k.dtype)
         b_A += tl.dot(b_kb, tl.trans(b_k))
-        b_dkb = tl.dot(b_dA, b_k)
+        b_dkb = tl.dot(b_dA.to(tl.float32), b_k.to(tl.float32))
         b_db += tl.sum(b_dkb * b_k, 1)
-        b_dk += tl.dot(tl.trans(b_dA), b_kb)
+        b_dk += tl.dot(tl.trans(b_dA.to(tl.float32)), b_kb.to(tl.float32))
         b_dk += b_dkb * b_b[:, None]
         tl.store(p_dk, b_dk.to(p_dk.dtype.element_ty), boundary_check=(0, 1))
     tl.store(p_db, b_db.to(p_db.dtype.element_ty), boundary_check=(0,))
@@ -217,6 +217,8 @@ def recompute_w_u_fwd(
     A: torch.Tensor,
     g: torch.Tensor | None = None,
     cu_seqlens: torch.LongTensor | None = None,
+    output_w: torch.Tensor | None = None,
+    output_u: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     B, T, H, K, V = *k.shape, v.shape[-1]
     BT = A.shape[-1]
@@ -225,9 +227,16 @@ def recompute_w_u_fwd(
 
     chunk_indices = prepare_chunk_indices(cu_seqlens, BT) if cu_seqlens is not None else None
     NT = triton.cdiv(T, BT) if cu_seqlens is None else len(chunk_indices)
-
-    w = torch.empty_like(k)
-    u = torch.empty_like(v)
+    
+    if output_w is None:
+        w = torch.empty_like(k)
+    else:
+        w = output_w
+    if output_u is None:
+        u = torch.empty_like(v)
+    else:
+        u = output_u
+    
     recompute_w_u_fwd_kernel[(NT, B*H)](
         k=k,
         v=v,
@@ -258,6 +267,10 @@ def prepare_wy_repr_bwd(
     du: torch.Tensor,
     g: torch.Tensor = None,
     cu_seqlens: torch.LongTensor | None = None,
+    output_dk: torch.Tensor | None = None,
+    output_dv: torch.Tensor | None = None,
+    output_db: torch.Tensor | None = None,
+    output_dg: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     B, T, H, K, V = *k.shape, v.shape[-1]
     BT = 64
@@ -267,10 +280,26 @@ def prepare_wy_repr_bwd(
     BK = min(max(triton.next_power_of_2(K), 16), CONST_TILING)
     BV = min(max(triton.next_power_of_2(V), 16), CONST_TILING)
 
-    dk = torch.empty_like(k)
-    dv = torch.empty_like(v)
-    dg = torch.empty_like(g) if g is not None else None
-    db = torch.empty_like(beta)
+    BK = min(max(triton.next_power_of_2(K), 16), CONST_TILING)
+    BV = min(max(triton.next_power_of_2(V), 16), CONST_TILING)
+
+    if output_dk is None:
+        dk = torch.empty_like(k)
+    else:
+        dk = output_dk
+    if output_dv is None:
+        dv = torch.empty_like(v)
+    else:
+        dv = output_dv
+    if output_dg is None:
+        dg = torch.empty_like(g) if g is not None else None
+    else:
+        dg = output_dg
+    if output_db is None:
+        db = torch.empty_like(beta)
+    else:
+        db = output_db
+        
     prepare_wy_repr_bwd_kernel[(NT, B * H)](
         k=k,
         v=v,

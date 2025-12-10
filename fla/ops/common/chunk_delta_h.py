@@ -137,7 +137,7 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
             b_w = tl.load(p_w, boundary_check=(0, 1))
             b_v += tl.dot(b_w, b_h4.to(b_w.dtype))
         p_v = tl.make_block_ptr(v, (T, V), (stride_v, 1), (i_t * BT, i_v * BV), (BT, BV), (1, 0))
-        b_v = tl.load(p_v, boundary_check=(0, 1)) - b_v
+        b_v = tl.load(p_v, boundary_check=(0, 1)).to(tl.float32) - b_v
 
         if SAVE_NEW_VALUE:
             p_v = tl.make_block_ptr(v_new, (T, V), (stride_v, 1), (i_t * BT, i_v * BV), (BT, BV), (1, 0))
@@ -146,9 +146,9 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
         last_idx = min((i_t + 1) * BT, T) - 1
         if USE_G:
             m_t = (i_t * BT + tl.arange(0, BT)) < T
-            b_g_last = tl.load(g + bos * H + last_idx * H + i_h)
+            b_g_last = tl.load(g + bos * H + last_idx * H + i_h).to(tl.float32)
             p_g = tl.make_block_ptr(g + bos * H + i_h, (T,), (H,), (i_t * BT,), (BT,), (0,))
-            b_g = tl.load(p_g, boundary_check=(0,))
+            b_g = tl.load(p_g, boundary_check=(0,)).to(tl.float32)
             if USE_EXP2:
                 b_v = b_v * tl.where(m_t, exp2(b_g_last - b_g), 0)[:, None]
                 b_g_last = exp2(b_g_last)
@@ -338,9 +338,9 @@ def chunk_gated_delta_rule_bwd_kernel_dhu_blockdim64(
 
         last_idx = min((i_t + 1) * BT, T) - 1
         if USE_G:
-            bg_last = tl.load(g + (bos + last_idx) * H + i_h)
+            bg_last = tl.load(g + (bos + last_idx) * H + i_h).to(tl.float32)
             p_g = tl.make_block_ptr(g + bos * H + i_h, (T,), (H,), (i_t * BT,), (BT,), (0,))
-            b_g = tl.load(p_g, boundary_check=(0,))
+            b_g = tl.load(p_g, boundary_check=(0,)).to(tl.float32)
             if USE_EXP2:
                 bg_last_exp = exp2(bg_last)
                 b_g_exp = exp2(b_g)
@@ -479,6 +479,7 @@ def chunk_gated_delta_rule_fwd_h(
     cu_seqlens: torch.LongTensor | None = None,
     chunk_indices: torch.LongTensor | None = None,
     use_exp2: bool = False,
+    output_final_state_buffer: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     B, T, H, K, V = *k.shape, u.shape[-1]
     BT = chunk_size
@@ -493,7 +494,13 @@ def chunk_gated_delta_rule_fwd_h(
     assert K <= 256, "current kernel does not support head dimension larger than 256."
 
     h = k.new_empty(B, NT, H, K, V)
-    final_state = k.new_empty(N, H, K, V, dtype=torch.float32) if output_final_state else None
+    if output_final_state:
+        if output_final_state_buffer is None:
+            final_state = k.new_empty(N, H, K, V, dtype=torch.float32)
+        else:
+            final_state = output_final_state_buffer
+    else:
+        final_state = None
 
     v_new = torch.empty_like(u) if save_new_value else None
     def grid(meta): return (triton.cdiv(V, meta['BV']), N*H)
@@ -534,6 +541,9 @@ def chunk_gated_delta_rule_bwd_dhu(
     chunk_size: int = 64,  # SY: remove this argument and force chunk size 64?
     chunk_indices: torch.LongTensor | None = None,
     use_exp2: bool = False,
+    output_dh: torch.Tensor | None = None,
+    output_dh0: torch.Tensor | None = None,
+    output_dv2: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     B, T, H, K, V = *q.shape, do.shape[-1]
     # N: the actual number of sequences in the batch with either equal or variable lengths
@@ -547,9 +557,18 @@ def chunk_gated_delta_rule_bwd_dhu(
     else:
         N, NT, chunk_offsets = len(cu_seqlens) - 1, len(chunk_indices), prepare_chunk_offsets(cu_seqlens, BT)
 
-    dh = q.new_empty(B, NT, H, K, V)
-    dh0 = torch.empty_like(h0, dtype=torch.float32) if h0 is not None else None
-    dv2 = torch.empty_like(dv)
+    if output_dh is None:
+        dh = q.new_empty(B, NT, H, K, V)
+    else:
+        dh = output_dh
+    if output_dh0 is None:
+        dh0 = torch.empty_like(h0, dtype=torch.float32) if h0 is not None else None
+    else:
+        dh0 = output_dh0
+    if output_dv2 is None:
+        dv2 = torch.empty_like(dv)
+    else:
+        dv2 = output_dv2
 
     def grid(meta): return (triton.cdiv(V, meta['BV']), N*H)
     chunk_gated_delta_rule_bwd_kernel_dhu_blockdim64[grid](

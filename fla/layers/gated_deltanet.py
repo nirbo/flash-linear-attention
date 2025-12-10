@@ -14,6 +14,7 @@ from torch.nn import functional as F
 from fla.layers.utils import get_unpad_data, index_first_axis, pad_input
 from fla.modules import FusedRMSNormGated, RMSNorm, ShortConvolution
 from fla.ops.gated_delta_rule import chunk_gated_delta_rule, fused_recurrent_gated_delta_rule
+from fla.utils import CUDAGraphManager
 
 if TYPE_CHECKING:
     from transformers.processing_utils import Unpack
@@ -206,6 +207,7 @@ class GatedDeltaNet(nn.Module):
         past_key_values: Cache | None = None,
         use_cache: bool | None = False,
         output_attentions: bool | None = False,
+        cuda_graph_manager: CUDAGraphManager | None = None,
         **kwargs: Unpack[dict],
     ) -> tuple[torch.Tensor, torch.Tensor | None, Cache | None]:
         if attention_mask is not None:
@@ -281,6 +283,7 @@ class GatedDeltaNet(nn.Module):
                 output_final_state=use_cache,
                 cu_seqlens=cu_seqlens,
                 use_qk_l2norm_in_kernel=True,
+                cuda_graph_manager=cuda_graph_manager,
             )
         elif mode == 'fused_recurrent':
             o, recurrent_state = fused_recurrent_gated_delta_rule(

@@ -10,7 +10,7 @@ import warnings
 from collections.abc import Callable
 from enum import Enum
 from functools import lru_cache
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Optional, Tuple
 
 import torch
 import triton
@@ -427,6 +427,205 @@ def get_all_max_shared_mem():
     except BaseException:
         _cpu_device_warning()
         return [-1]
+
+
+
+class CUDAGraphManager:
+    """
+    Manages static memory buffers for CUDA graph-compatible GatedDeltaNet operations.
+
+    The manager pre-allocates all tensors that will be saved for backward pass,
+    ensuring their memory addresses remain constant across graph replays.
+    """
+
+    def __init__(
+        self,
+        max_batch_size: int,
+        max_seq_len: int,
+        num_heads: int,
+        head_dim: int,
+        expand_v: int = 2,
+        chunk_size: int = 64,
+        device: torch.device = None,
+        dtype: torch.dtype = torch.bfloat16,
+    ):
+        self.max_batch_size = max_batch_size
+        self.max_seq_len = max_seq_len
+        self.num_heads = num_heads
+        self.head_dim = head_dim
+        self.expand_v = expand_v
+        self.chunk_size = chunk_size
+        self.device = device or torch.device('cuda')
+        self.dtype = dtype
+
+        # Derived dimensions
+        self.value_dim = head_dim * expand_v
+        self.num_chunks = (max_seq_len + chunk_size - 1) // chunk_size
+
+        # Allocate buffers
+        self._allocate_buffers()
+
+    def _allocate_buffers(self) -> None:
+        """Pre-allocate all static buffers in flattened form."""
+        B = self.max_batch_size
+        T = self.max_seq_len
+        H = self.num_heads
+        K = self.head_dim
+        V = self.value_dim
+        BT = self.chunk_size
+
+        # Flattened size (treating B*T as contiguous sequence dim)
+        flat_size = B * T
+
+        # Input buffers (flattened)
+        self.buf_q = torch.empty(flat_size, H, K, device=self.device, dtype=self.dtype)
+        self.buf_k = torch.empty(flat_size, H, K, device=self.device, dtype=self.dtype)
+        self.buf_v = torch.empty(flat_size, H, V, device=self.device, dtype=self.dtype)
+        self.buf_g = torch.empty(flat_size, H, device=self.device, dtype=torch.float32)
+        self.buf_beta = torch.empty(flat_size, H, device=self.device, dtype=self.dtype)
+
+        # Optional input buffers (Batch-only dim, no flattening needed as T is not involved)
+        self.buf_initial_state = torch.empty(B, H, K, V, device=self.device, dtype=self.dtype)
+        # Intermediate buffers
+        # buf_A: (B, T, H, BT) -> Flat: (B*T, H, BT)
+        self.buf_A = torch.empty(flat_size, H, BT, device=self.device, dtype=self.dtype)
+
+        # Optional normalization stats
+        self.buf_q_rstd = torch.empty(flat_size, H, device=self.device, dtype=torch.float32)
+        self.buf_k_rstd = torch.empty(flat_size, H, device=self.device, dtype=torch.float32)
+
+        # Output buffers
+        self.buf_o = torch.empty(flat_size, H, V, device=self.device, dtype=self.dtype)
+        self.buf_final_state = torch.empty(B, H, K, V, device=self.device, dtype=self.dtype)
+
+        # Gradient buffers
+        self.buf_dq = torch.empty(flat_size, H, K, device=self.device, dtype=torch.float32)
+        self.buf_dk = torch.empty(flat_size, H, K, device=self.device, dtype=torch.float32)
+        self.buf_dv = torch.empty(flat_size, H, V, device=self.device, dtype=torch.float32)
+        self.buf_dg = torch.empty(flat_size, H, device=self.device, dtype=torch.float32)
+        self.buf_dbeta = torch.empty(flat_size, H, device=self.device, dtype=torch.float32)
+
+        # Track actual dimensions for current batch
+        self._current_B = 0
+        self._current_T = 0
+
+    def copy_inputs(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        g: torch.Tensor,
+        beta: torch.Tensor,
+        initial_state: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
+        """
+        Copy dynamic input tensors to static buffers.
+        Unpacks (B, T) to flattened (B*T) buffer but returns (B, T) view.
+        """
+        B, T, H, K = q.shape
+        V = v.shape[-1]
+        flat_cur = B * T
+
+        if B > self.max_batch_size:
+            raise ValueError(f"Batch size {B} exceeds max {self.max_batch_size}")
+        if T > self.max_seq_len:
+            raise ValueError(f"Seq len {T} exceeds max {self.max_seq_len}")
+
+        self._current_B = B
+        self._current_T = T
+
+        # Copy to static buffers (reshaping to flat)
+        # We perform copy on flat view to ensure contiguous fill
+        self.buf_q[:flat_cur].copy_(q.flatten(0, 1))
+        self.buf_k[:flat_cur].copy_(k.flatten(0, 1))
+        self.buf_v[:flat_cur].copy_(v.flatten(0, 1))
+        self.buf_g[:flat_cur].copy_(g.flatten(0, 1))
+        self.buf_beta[:flat_cur].copy_(beta.flatten(0, 1))
+
+        if initial_state is not None:
+            self.buf_initial_state[:B].copy_(initial_state)
+            static_initial_state = self.buf_initial_state[:B]
+        else:
+            static_initial_state = None
+
+        # Return reshaped views (B, T, ...)
+        # These views will have standard packed strides for (T, ...)
+        return (
+            self.buf_q[:flat_cur].view(B, T, H, K),
+            self.buf_k[:flat_cur].view(B, T, H, K),
+            self.buf_v[:flat_cur].view(B, T, H, V),
+            self.buf_g[:flat_cur].view(B, T, H),
+            self.buf_beta[:flat_cur].view(B, T, H),
+            static_initial_state,
+        )
+
+    def get_output_buffers(self) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Get output buffers viewed as (B, T, ...)."""
+        B, T = self._current_B, self._current_T
+        flat_cur = B * T
+        return (
+            self.buf_o[:flat_cur].view(B, T, self.num_heads, self.value_dim),
+            self.buf_final_state[:B]
+        )
+
+    def get_grad_buffers(self) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Get gradient buffers viewed as (B, T, ...)."""
+        B, T = self._current_B, self._current_T
+        flat_cur = B * T
+        K = self.head_dim
+        V = self.value_dim
+        H = self.num_heads
+        
+        return (
+            self.buf_dq[:flat_cur].view(B, T, H, K),
+            self.buf_dk[:flat_cur].view(B, T, H, K),
+            self.buf_dv[:flat_cur].view(B, T, H, V),
+            self.buf_dg[:flat_cur].view(B, T, H),
+            self.buf_dbeta[:flat_cur].view(B, T, H),
+        )
+    
+    # Need to expose buf_A view logic correctly too since chunk.py accesses it directly
+    def get_buf_A_view(self):
+        B, T = self._current_B, self._current_T
+        BT = self.chunk_size
+        flat_cur = B * T
+        return self.buf_A[:flat_cur].view(B, T, self.num_heads, BT)
+
+    def get_input_buffers(self) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
+        """Get input buffers viewed as (B, T, ...)."""
+        B, T = self._current_B, self._current_T
+        flat_cur = B * T
+        H, K, V = self.num_heads, self.head_dim, self.value_dim
+        
+        static_initial_state = self.buf_initial_state[:B] if self._current_B > 0 else None
+        
+        return (
+            self.buf_q[:flat_cur].view(B, T, H, K),
+            self.buf_k[:flat_cur].view(B, T, H, K),
+            self.buf_v[:flat_cur].view(B, T, H, V),
+            self.buf_g[:flat_cur].view(B, T, H),
+            self.buf_beta[:flat_cur].view(B, T, H),
+            static_initial_state,
+        )
+
+    def memory_footprint(self) -> int:
+        total = 0
+        for attr_name in dir(self):
+            if attr_name.startswith('buf_') and isinstance(getattr(self, attr_name), torch.Tensor):
+                total += getattr(self, attr_name).numel() * getattr(self, attr_name).element_size()
+        return total
+
+    def __repr__(self) -> str:
+        mem_mb = self.memory_footprint() / (1024 * 1024)
+        return (
+            f"CUDAGraphManager("
+            f"max_batch={self.max_batch_size}, "
+            f"max_seq={self.max_seq_len}, "
+            f"heads={self.num_heads}, "
+            f"head_dim={self.head_dim}, "
+            f"memory={mem_mb:.1f}MB)"
+        )
+
 
 
 class Backend(Enum):
