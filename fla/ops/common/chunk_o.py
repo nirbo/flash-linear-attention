@@ -676,9 +676,6 @@ def chunk_bwd_dqkwg(
         dg = torch.empty(NK, *g.shape, dtype=torch.float32, device=g.device) if g is not None else None
     else:
             if g is not None:
-                 # dg kernel output is (NK, B, T, H), but we need (B, T, H)
-                 # We allocate a temporary buffer for the split gradients first, 
-                 # then reduce them into the final output_dg.
                  dg = torch.empty(NK, *g.shape, dtype=torch.float32, device=g.device)
             else:
                  dg = None
