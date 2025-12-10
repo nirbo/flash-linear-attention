@@ -378,23 +378,7 @@ def solve_tril(
         Ai = torch.zeros_like(A, dtype=output_dtype)
     else:
         Ai = output
-        Ai.zero_()  # Ensure zero init as some kernels might rely on accumulation or sparsity? 
-        # Actually solve_tril kernels seem to overwrite or use mask, but better safe.
-        # Looking at kernel: 
-        # b_A = tl.where((o_i == i)[:, None], b_a, b_A) -> updates initialization
-        # b_Ai initialized from 0 in kernel logic? 
-        # Kernel code:
-        # b_A = ... load from A ...
-        # ... logic ...
-        # tl.store(p_Ai, b_A ...)
-        # So kernel writes fully. But let's check if it assumes zeros.
-        # "Ai = torch.zeros_like(A)" in original code suggests it might be needed if mask is involved?
-        # Re-reading kernel:
-        # It never loads from Ai except for TMA descriptor creation which expects a pointer.
-        # It computes b_A purely from A and then stores to Ai.
-        # So explicit zeroing might not be strictly needed but "torch.zeros_like" was there.
-        # However, for static buffers, we just pass the pointer.
-        pass
+        Ai.zero_()  # Ensure zero init for safety
     if BT == 16:
         merge_fn = solve_tril_16x16_kernel
     elif BT == 32:

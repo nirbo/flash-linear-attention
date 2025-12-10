@@ -136,33 +136,16 @@ def test_cuda_graph_capture_replay(B, T, H, K, V, dtype):
     # Replay with new data
     q_new = torch.randn(B, T, H, K, device='cuda', dtype=dtype)
     k_new = torch.randn(B, T, H, K, device='cuda', dtype=dtype)
-    # Define g_new for the replay test
     g_new = torch.nn.functional.logsigmoid(torch.randn(B, T, H, device='cuda', dtype=dtype))
     
-    # We must assume the manager handles copy inside copy_inputs called by function.
-    # But usually for graph replay, we need to copy separate inputs to the CAPTURED input addresses.
-    # Our Manager.copy_inputs copies `q_new` to `buf_q`.
-    # And the graph was captured utilizing `buf_q`.
-    # So calling the function again (which calls copy_inputs) SHOULD work if copy_inputs is essentially recordable or outside graph?
-    # Wait. `copy_inputs` calls `copy_` which is a kernel.
-    # If we call `chunk_gated_delta_rule` again OUTSIDE graph context, it runs `copy_inputs` eagerly.
-    # Then we verify if `o` updates?
-    # BUT `o` is result of graph replay?
-    # If we just run the Python function `chunk_gated_delta_rule`, it launches kernels.
-    # To use the CAPTURED graph, we must replay `g_cuda.replay()`.
-    # But before replay, we must update `buf_q`.
-    # `manager.copy_inputs(q_new, ...)` updates `buf_q`.
-    # Since `copy_inputs` is distinct from the compute graph (it prepares inputs), we run it eagerly.
-    
+    # Update managed buffers with new inputs
     manager.copy_inputs(q_new, k_new, v, g_new, beta)
+    
+    # Replay the graph
     g_cuda.replay()
     
-    # Check if `o` (which is likely backed by `buf_o`) contains result for `q_new`.
-    # If `o` was a tensor created during capture...
-    # chunk_gated_delta_rule returns `o_out` which is a slice of `buf_o`.
-    # Slicing creates a view. Ptr is same.
-    # The Tensor object `o` returned from capture might be "stale" if we don't hold ref?
-    # We hold `o`.
+    # Verify o (captured tensor) now contains the result for the new inputs
+    # The output tensor o is effectively a view into manager.buf_o, which the graph writes to.
     
     # Verify result correctness against eager run
     o_ref, _ = chunk_gated_delta_rule(q_new, k_new, v, g_new, beta)
