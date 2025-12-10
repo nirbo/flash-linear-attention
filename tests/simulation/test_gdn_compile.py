@@ -35,7 +35,7 @@ def train_loop(model, optimizer, B, T, D, steps=20):
     model.train()
     loss_fn = nn.CrossEntropyLoss()
     
-    # Static inputs for graph simulation style (though we generate new ones)
+    # Static inputs for graph simulation style
     for i in range(steps):
         x = torch.randn(B, T, D, device='cuda', dtype=torch.bfloat16)
         y = torch.randint(0, 100, (B, T), device='cuda')
