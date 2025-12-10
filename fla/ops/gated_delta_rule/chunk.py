@@ -152,7 +152,7 @@ def chunk_gated_delta_rule_bwd(
         output_dq=output_dq,
         output_dk=output_dk,
         output_dw=None,
-        output_dg=None, # We accumulate dg later
+        output_dg=None,
     )
     
     # Use explicit output buffers for prepare_wy_repr_bwd if provided
