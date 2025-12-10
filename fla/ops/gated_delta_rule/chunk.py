@@ -101,6 +101,7 @@ def chunk_gated_delta_rule_bwd(
         g=g,
         cu_seqlens=cu_seqlens,
     )
+    
     h, v_new, _ = chunk_gated_delta_rule_fwd_h(
         k=k,
         w=w,
