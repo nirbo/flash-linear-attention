@@ -343,9 +343,9 @@ class ChunkGatedDeltaRuleFunctionGraphSafe(torch.autograd.Function):
             q=q,
             k=k,
             v=v,
-            g=g, # This is the static g (buffer)
+            g=g,
             beta=beta,
-            A=A, # This is static A
+            A=A,
             scale=ctx.scale,
             initial_state=initial_state,
             do=do,
