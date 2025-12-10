@@ -119,6 +119,9 @@ def chunk_gated_delta_rule_bwd(
         scale=scale,
         cu_seqlens=cu_seqlens,
     )
+    if torch.isnan(dv).any():
+        print("NaN in dv! Saving debug_inputs.pt")
+        torch.save({'q':q, 'k':k, 'g':g, 'do':do, 'scale':scale}, 'debug_inputs.pt')
     dh, dh0, dv = chunk_gated_delta_rule_bwd_dhu(
         q=q,
         k=k,
@@ -423,6 +426,7 @@ class ChunkGatedDeltaRuleFunctionGraphSafe(torch.autograd.Function):
         return o_out, final_state_out
 
     @staticmethod
+    @input_guard
     def backward(ctx, do, d_final_state):
         q, q_rstd, k, k_rstd, v, g, beta, A, initial_state, cu_seqlens = ctx.saved_tensors
         manager = ctx.cuda_graph_manager
@@ -474,7 +478,6 @@ class ChunkGatedDeltaRuleFunctionGraphSafe(torch.autograd.Function):
             dht=d_final_state,
             cu_seqlens=cu_seqlens,
             # Outputs
-            output_dq=static_dq,
             output_dk=static_dk,
             output_dv=static_dv,
             output_dg=static_dg,
